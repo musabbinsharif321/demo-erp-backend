@@ -1,0 +1,1002 @@
+from decimal import Decimal
+from rest_framework import serializers
+from .models import (
+    ShopSettings,
+    Party,
+    CustomerSite,
+    Category,
+    Product,
+    Bank,
+    Transaction,
+    TransactionItem,
+    ExpenseCategory,
+    Expense,
+    Hawlat
+)
+
+class ShopSettingsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ShopSettings
+        fields = '__all__'
+
+BN_TO_EN_DIGITS = str.maketrans('০১২৩৪৫৬৭৮৯', '0123456789')
+
+def normalize_bengali_digits(val):
+    if val is None:
+        return val
+    return str(val).translate(BN_TO_EN_DIGITS)
+
+class CustomerSiteSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(read_only=True)
+    customer_name = serializers.CharField(source='customer.name', read_only=True)
+
+    class Meta:
+        model = CustomerSite
+        fields = '__all__'
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            mutable_data = data.copy()
+            if 'contact_phone' in mutable_data and mutable_data['contact_phone'] is not None:
+                mutable_data['contact_phone'] = normalize_bengali_digits(mutable_data['contact_phone'])
+            return super().to_internal_value(mutable_data)
+        return super().to_internal_value(data)
+
+
+def recalculate_party_balances(party):
+    if not party:
+        return
+    import json
+    from django.db.models import Sum
+    from decimal import Decimal
+    
+    is_supplier = (party.party_type in ['supplier', 'both'])
+    is_engineer = (party.party_type == 'engineer')
+    
+    if is_supplier:
+        purchases = Transaction.objects.filter(party=party, transaction_type='purchase').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected'])
+        purchases_tot = Decimal('0.00')
+        for p_tx in purchases:
+            amt = Decimal(str(p_tx.total_amount or 0))
+            if p_tx.notes and p_tx.notes.strip().startswith('{'):
+                try:
+                    meta = json.loads(p_tx.notes.split('\n')[0])
+                    ship_payer = meta.get('shippingPayer', 'shop')
+                    labor_payer = meta.get('laborPayer', 'shop')
+                    ship = Decimal(str(meta.get('shippingCost') or meta.get('shipping_cost') or meta.get('transportCost') or 0)) if ship_payer != 'supplier' else Decimal('0.00')
+                    lab = Decimal(str(meta.get('laborCost') or meta.get('labor_cost') or 0)) if labor_payer != 'supplier' else Decimal('0.00')
+                    amt = max(Decimal('0.00'), amt - (ship + lab))
+                except Exception:
+                    pass
+            purchases_tot += amt
+
+        purchases_paid = purchases.aggregate(p=Sum('paid_amount'))['p'] or Decimal('0.00')
+        payments_agg = Transaction.objects.filter(party=party, transaction_type='payment_out').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).aggregate(p=Sum('paid_amount'), d=Sum('discount'))
+        payments_tot = (payments_agg['p'] or Decimal('0.00')) + (payments_agg['d'] or Decimal('0.00'))
+        returns_agg = Transaction.objects.filter(party=party, transaction_type='purchase_return').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).aggregate(r=Sum('total_amount'), p=Sum('paid_amount'))
+        returns_tot = returns_agg['r'] or Decimal('0.00')
+        returns_refund_received = returns_agg['p'] or Decimal('0.00')
+        net_purchase_returns = returns_tot - returns_refund_received
+        loans_tot = Transaction.objects.filter(party=party, transaction_type='loan_in').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).aggregate(s=Sum('total_amount'))['s'] or Decimal('0.00')
+        
+        net_balance = (party.opening_balance or Decimal('0.00')) + purchases_tot + loans_tot - purchases_paid - payments_tot - net_purchase_returns
+        party.total_purchases = purchases_tot
+    elif is_engineer:
+        payments_agg = Transaction.objects.filter(party=party, transaction_type__in=['payment_out', 'payment_in', 'payment', 'expense']).exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).aggregate(p=Sum('paid_amount'), d=Sum('discount'))
+        payments_tot = (payments_agg['p'] or Decimal('0.00')) + (payments_agg['d'] or Decimal('0.00'))
+        
+        # Calculate sales commission earned by this engineer
+        sales_with_eng = Transaction.objects.filter(transaction_type='sale').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).filter(notes__contains=str(party.id))
+        total_comm = Decimal('0.00')
+        for s in sales_with_eng:
+            if s.notes and s.notes.strip().startswith('{'):
+                try:
+                    meta = json.loads(s.notes.split('\n')[0])
+                    eng_id = meta.get('engineerId') or meta.get('selectedEngineerId')
+                    if str(eng_id) == str(party.id):
+                        comm = Decimal(str(meta.get('engineerTotalCommission') or 0))
+                        if comm == 0:
+                            r_kg = Decimal(str(meta.get('engineerRodKg') or 0))
+                            r_rate = Decimal(str(meta.get('engineerRodRate') or 0))
+                            c_bag = Decimal(str(meta.get('engineerCementBags') or 0))
+                            c_rate = Decimal(str(meta.get('engineerCementRate') or 0))
+                            comm = (r_kg * r_rate) + (c_bag * c_rate)
+                        total_comm += comm
+                except Exception:
+                    pass
+
+        net_balance = (party.opening_balance or Decimal('0.00')) + total_comm - payments_tot
+        party.total_sales = total_comm
+    else:
+        sales_tot = Transaction.objects.filter(party=party, transaction_type='sale').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).aggregate(s=Sum('total_amount'))['s'] or Decimal('0.00')
+        sales_paid = Transaction.objects.filter(party=party, transaction_type='sale').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).aggregate(p=Sum('paid_amount'))['p'] or Decimal('0.00')
+        payments_agg = Transaction.objects.filter(party=party, transaction_type='payment_in').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).aggregate(p=Sum('paid_amount'), d=Sum('discount'))
+        payments_tot = (payments_agg['p'] or Decimal('0.00')) + (payments_agg['d'] or Decimal('0.00'))
+        payments_out_agg = Transaction.objects.filter(party=party, transaction_type='payment_out').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).aggregate(p=Sum('paid_amount'))['p'] or Decimal('0.00')
+        returns_agg = Transaction.objects.filter(party=party, transaction_type='sale_return').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).aggregate(r=Sum('total_amount'), p=Sum('paid_amount'))
+        returns_tot = returns_agg['r'] or Decimal('0.00')
+        returns_refund_paid = returns_agg['p'] or Decimal('0.00')
+        net_returns_adjusted = returns_tot - returns_refund_paid
+        
+        net_balance = (party.opening_balance or Decimal('0.00')) + sales_tot - sales_paid - payments_tot + payments_out_agg - net_returns_adjusted
+        party.total_sales = sales_tot
+
+    if net_balance >= Decimal('0.00'):
+        party.total_due = net_balance
+        party.advance_balance = Decimal('0.00')
+    else:
+        party.total_due = Decimal('0.00')
+        party.advance_balance = abs(net_balance)
+        
+    update_fields = ['total_sales', 'total_purchases', 'total_due', 'advance_balance'] if is_supplier else ['total_sales', 'total_due', 'advance_balance']
+    party.save(update_fields=update_fields)
+
+class PartySerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(read_only=True)
+    sites = CustomerSiteSerializer(many=True, read_only=True)
+    
+    class Meta:
+        model = Party
+        fields = '__all__'
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            mutable_data = data.copy()
+            for key in ['phone', 'alt_phone', 'opening_balance', 'credit_limit', 'discount_percent', 'credit_days', 'postcode', 'nid', 'tin_number']:
+                if key in mutable_data and mutable_data[key] is not None:
+                    mutable_data[key] = normalize_bengali_digits(mutable_data[key])
+            return super().to_internal_value(mutable_data)
+        return super().to_internal_value(data)
+
+class CategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Category
+        fields = '__all__'
+
+class ProductSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(read_only=True)
+    category_detail = CategorySerializer(source='category', read_only=True)
+
+    class Meta:
+        model = Product
+        fields = '__all__'
+
+class BankSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Bank
+        fields = '__all__'
+
+class RoundedDecimalField(serializers.DecimalField):
+    def to_internal_value(self, data):
+        if data is None or data == '':
+            return None
+        try:
+            cleaned = normalize_bengali_digits(data)
+            val = Decimal(str(cleaned))
+            rounded_val = val.quantize(Decimal('0.01'))
+            return super().to_internal_value(rounded_val)
+        except Exception:
+            return super().to_internal_value(data)
+
+class TransactionItemSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(read_only=True)
+    quantity = RoundedDecimalField(max_digits=10, decimal_places=2, required=False)
+    price = RoundedDecimalField(max_digits=12, decimal_places=2, required=False)
+    total = RoundedDecimalField(max_digits=12, decimal_places=2, required=False)
+    sell_price = RoundedDecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+
+    class Meta:
+        model = TransactionItem
+        fields = ['id', 'product', 'product_name', 'quantity', 'price', 'sell_price', 'unit', 'total']
+
+import re
+
+import re
+
+def normalize_bn_en_digits(text):
+    if not text:
+        return ""
+    bn_digits = '০১২৩৪৫৬৭৮৯'
+    en_digits = '0123456789'
+    res = text
+    for b, e in zip(bn_digits, en_digits):
+        res = res.replace(b, e)
+    return res
+
+def find_or_create_product_for_purchase(item_name, unit, price, brand_param=None, sell_price=None):
+    from .models import Product, Category
+    if not item_name or not item_name.strip():
+        return None
+
+    raw_name = item_name.strip()
+    # Remove duplicate consecutive repeating words e.g. "সিমেন্ট সিমেন্ট" -> "সিমেন্ট"
+    cleaned_name = re.sub(r'(\b\S+\b)(?:\s+\1)+', r'\1', raw_name, flags=re.IGNORECASE)
+    cleaned_norm = normalize_bn_en_digits(cleaned_name.lower())
+
+    # 1. Direct Name Match or Cleaned Name Match
+    exact_match = Product.objects.filter(name__iexact=raw_name).first() or Product.objects.filter(name__iexact=cleaned_name).first()
+    if exact_match:
+        return exact_match
+
+    # Extract MM (Rod)
+    mm_match = re.search(r'(\b\d{1,2}(?:\.\d+)?)\s*(?:mm|মিমি|মিলি)\b', cleaned_norm)
+    mm_val = (mm_match.group(1) + 'mm') if mm_match else None
+    if not mm_val and ('rod' in cleaned_norm or 'রড' in cleaned_norm):
+        size_num = re.search(r'\b(8|10|12|16|20|22|25|32)\b', cleaned_norm)
+        if size_num:
+            mm_val = size_num.group(1) + 'mm'
+
+    # Extract Size (Ring/Angle)
+    size_match = re.search(r'(\d+(?:\.\d+)?(?:\s*["\']|\s*inch|\s*ইঞ্চি|\s*x\s*\d+|\s*×\s*\d+)?)\b', cleaned_norm)
+    size_val = size_match.group(1) if size_match else None
+
+    # Detect Brand dictionary in Bengali and English
+    brand_dictionary = {
+        'shah': ['shah', 'শাহ'],
+        'bsrm': ['bsrm', 'বিএসআরএম', 'বি এস আর এম'],
+        'ksrm': ['ksrm', 'কেএসআরএম', 'কে এস আর এম'],
+        'aks': ['aks', 'একেএস', 'এ কে এস'],
+        'gph': ['gph', 'জিপিএইচ', 'জি পি এইচ'],
+        'anwar': ['anwar', 'আনোয়ার'],
+        'seven rings': ['seven rings', 'sevenring', 'সেভেন রিংস', 'সেভেন রিং'],
+        'supercream': ['supercream', 'সুপারক্রিম', 'সুপারক্যাপ'],
+        'holcim': ['holcim', 'হোলসিম'],
+        'fresh': ['fresh', 'ফ্রেশ'],
+        'premier': ['premier', 'প্রিমিয়ার'],
+        'crown': ['crown', 'ক্রাউন'],
+        'akij': ['akij', 'আকিজ'],
+        'king brand': ['king brand', 'কিং ব্র্যান্ড']
+    }
+
+    matched_brand_tokens = []
+    for brand_key, aliases in brand_dictionary.items():
+        if any(alias in cleaned_norm for alias in aliases):
+            matched_brand_tokens = aliases
+            break
+
+    # Determine Category Head
+    if 'rod' in cleaned_norm or 'রড' in cleaned_norm or mm_val:
+        category_head = 'রড'
+    elif 'cement' in cleaned_norm or 'সিমেন্ট' in cleaned_norm or any(alias in cleaned_norm for alias in brand_dictionary['shah'] + brand_dictionary['seven rings'] + brand_dictionary['holcim'] + brand_dictionary['fresh']):
+        category_head = 'সিমেন্ট'
+    elif 'ring' in cleaned_norm or 'রিং' in cleaned_norm or 'angle' in cleaned_norm or 'অ্যাঙ্গেল' in cleaned_norm:
+        category_head = 'রিং'
+    else:
+        category_head = 'অন্যান্য'
+
+    candidate_qs = Product.objects.all()
+
+    # Match existing products
+    for prod in candidate_qs:
+        p_name_norm = normalize_bn_en_digits(prod.name.lower())
+        p_brand_norm = normalize_bn_en_digits((prod.brand or '').lower())
+        p_combined = f"{p_name_norm} {p_brand_norm}"
+
+        # Check if product names normalized match
+        clean_p_name = re.sub(r'(\b\S+\b)(?:\s+\1)+', r'\1', prod.name, flags=re.IGNORECASE)
+        if cleaned_name.lower() == clean_p_name.lower():
+            return prod
+
+        if category_head == 'সিমেন্ট':
+            is_item_opc = 'opc' in cleaned_norm
+            is_item_pcc = 'pcc' in cleaned_norm
+            is_prod_opc = 'opc' in p_combined
+            is_prod_pcc = 'pcc' in p_combined
+
+            # If item explicitly specifies OPC or PCC, it cannot conflict with product's type
+            if is_item_opc and is_prod_pcc:
+                continue
+            if is_item_pcc and is_prod_opc:
+                continue
+
+            # Strict cement sub-brand / variant definitions
+            cement_variants = [
+                ('supercrete plus', ['supercrete plus', 'সুপারক্রিট প্লাস', 'সুপার ক্রিট প্লাস']),
+                ('supercrete', ['supercrete', 'সুপারক্রিট', 'সুপার ক্রিট']),
+                ('strong structure', ['strong structure', 'স্ট্রং স্ট্রাকচার', 'স্ট্রংস্ট্রাকচার']),
+                ('coastal guard', ['coastal guard', 'কোস্টাল গার্ড', 'কোস্টালগার্ড']),
+                ('waterprotect', ['waterprotect', 'water protect', 'ওয়াটারপ্রোটেক্ট', 'ওয়াটারপ্রোটেক্ট', 'ওয়াটার প্রোটেক্ট']),
+                ('king brand', ['king brand', 'কিং ব্র্যান্ড', 'কিংব্র্যান্ড']),
+                ('gold', ['gold', 'গোল্ড']),
+                ('complete', ['complete', 'কমপ্লিট']),
+                ('composite', ['composite', 'কম্পোজিট']),
+                ('special', ['special', 'স্পেশাল']),
+            ]
+
+            item_variant_key = None
+            for v_key, v_aliases in cement_variants:
+                if any(alias in cleaned_norm for alias in v_aliases):
+                    item_variant_key = v_key
+                    break
+
+            if item_variant_key:
+                # Target product must contain the matching variant
+                v_aliases = dict(cement_variants)[item_variant_key]
+                if not any(alias in p_combined for alias in v_aliases):
+                    continue
+
+                # If brand is detected, it must match
+                if matched_brand_tokens and not any(alias in p_combined for alias in matched_brand_tokens):
+                    continue
+
+                # Ensure base "supercrete" does not match "supercrete plus"
+                if item_variant_key == 'supercrete':
+                    plus_aliases = ['plus', 'প্লাস']
+                    if any(pa in p_combined for pa in plus_aliases):
+                        continue
+
+                return prod
+            else:
+                # Untyped cement without specific variant
+                if matched_brand_tokens and any(alias in p_combined for alias in matched_brand_tokens):
+                    has_other_variant = any(any(alias in p_combined for alias in v_aliases) for _, v_aliases in cement_variants)
+                    if not has_other_variant:
+                        return prod
+                elif ('সিমেন্ট' in p_name_norm or (prod.category_name and 'সিমেন্ট' in prod.category_name)):
+                    brand_word = cleaned_name.replace('সিমেন্ট', '').strip().lower()
+                    if brand_word and brand_word in p_name_norm:
+                        return prod
+
+        elif category_head == 'রড':
+            brand_matched = True
+            if matched_brand_tokens:
+                brand_matched = any(alias in p_combined for alias in matched_brand_tokens)
+
+            mm_matched = True
+            if mm_val:
+                digit = mm_val.replace('mm', '')
+                mm_matched = (digit in p_name_norm)
+
+            if brand_matched and mm_matched:
+                return prod
+
+        elif category_head == 'রিং':
+            brand_matched = True
+            if matched_brand_tokens:
+                brand_matched = any(alias in p_combined for alias in matched_brand_tokens)
+
+            size_matched = True
+            if size_val:
+                size_digit = size_val.replace('"', '').replace("'", '').strip()
+                size_matched = (size_digit in p_name_norm)
+
+            if brand_matched and size_matched:
+                return prod
+
+    # If no existing product matched, create NEW product automatically with CLEANED NAME
+    cat_obj = Category.objects.filter(name__iexact=category_head).first()
+    if not cat_obj:
+        cat_obj = Category.objects.create(name=category_head)
+
+    sp = float(sell_price) if (sell_price and float(sell_price) > 0) else round((float(price or 0) * 1.1), 2)
+
+    new_prod = Product.objects.create(
+        name=cleaned_name,
+        category=cat_obj,
+        category_name=category_head,
+        brand=brand_param or '',
+        unit=unit or ('কেজি' if category_head == 'রড' else 'বস্তা' if category_head == 'সিমেন্ট' else 'পিস'),
+        purchase_price=price or 0.00,
+        sell_price=sp,
+        stock=0.00
+    )
+    return new_prod
+
+
+def get_available_balances(exclude_tx_id=None, exclude_expense_id=None):
+    from django.db.models import Sum
+    from .models import Transaction, Expense, Bank
+
+    sales_qs = Transaction.objects.filter(transaction_type='sale').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).exclude(notes__contains='isHistoricalLedger')
+    purchases_qs = Transaction.objects.filter(transaction_type='purchase').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).exclude(notes__contains='isHistoricalLedger')
+    sale_returns_qs = Transaction.objects.filter(transaction_type='sale_return').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).exclude(notes__contains='isHistoricalLedger')
+    p_in_qs = Transaction.objects.filter(transaction_type__in=['payment_in', 'loan_in']).exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).exclude(notes__contains='isHistoricalLedger')
+    p_out_qs = Transaction.objects.filter(transaction_type='payment_out').exclude(status__in=['pending', 'draft', 'cancelled', 'rejected']).exclude(notes__contains='isHistoricalLedger')
+    exp_qs = Expense.objects.all()
+
+    if exclude_tx_id:
+        sales_qs = sales_qs.exclude(id=exclude_tx_id)
+        purchases_qs = purchases_qs.exclude(id=exclude_tx_id)
+        sale_returns_qs = sale_returns_qs.exclude(id=exclude_tx_id)
+        p_in_qs = p_in_qs.exclude(id=exclude_tx_id)
+        p_out_qs = p_out_qs.exclude(id=exclude_tx_id)
+
+    if exclude_expense_id:
+        exp_qs = exp_qs.exclude(id=exclude_expense_id)
+
+    cash_in = Decimal('0.00')
+    bank_in = Decimal('0.00')
+
+    import json
+
+    # Process all active sales and payment_in transactions
+    for t in list(sales_qs) + list(p_in_qs):
+        pm = (t.payment_method or 'cash').lower()
+        paid = Decimal(str(t.paid_amount or 0))
+        meta = {}
+        if t.notes and t.notes.strip().startswith('{'):
+            try:
+                meta = json.loads(t.notes.split('\n')[0])
+            except Exception:
+                meta = {}
+
+        if pm == 'split':
+            # Split: Only the cash portion enters cash immediately
+            c_part = Decimal(str(meta.get('cashPaidAmount') or meta.get('splitCashAmount') or 0))
+            q_part = Decimal(str(meta.get('chequePaidAmount') or meta.get('splitChequeAmount') or 0))
+            if c_part == 0 and q_part == 0:
+                c_part = paid
+            cash_in += c_part
+            # Cheque portion ONLY enters cash balance once it is cleared/cashed
+            if t.cheque_status == 'cleared':
+                cash_in += q_part
+        elif pm in ['cheque', 'check']:
+            # Standalone cheque: ONLY enters balance once cashed/cleared
+            if t.cheque_status == 'cleared':
+                cash_in += paid
+        elif pm in ['bank', 'banktobank', 'mobile_banking', 'mobile', 'bkash']:
+            bank_in += paid
+        else: # cash
+            cash_in += paid
+    
+    # Calculate extra shipping and labor paid in cash from active purchases
+    # (Skip each item individually if already recorded in Expense table to prevent double-counting)
+    covered_shipping_invoices = set()
+    covered_purchase_labor_invoices = set()
+    covered_cement_loading_invoices = set()
+    covered_cement_unloading_invoices = set()
+    covered_rod_labor_invoices = set()
+    covered_rod_unloading_invoices = set()
+
+    import re
+
+    for e in exp_qs:
+        title = e.title or ''
+        notes = e.notes or ''
+        text = f"{title} {notes}"
+        
+        found_invs = set()
+        # 1. Match INV-... or PUR-... (case-insensitive)
+        for inv in re.findall(r'(?:INV|PUR)-[A-Za-z0-9-]+', text, re.IGNORECASE):
+            inv_clean = inv.strip()
+            found_invs.add(inv_clean)
+            found_invs.add(inv_clean.upper())
+            found_invs.add(inv_clean.lower())
+        
+        # 2. Match বাংলা চালান ফরম্যাট যেমন চালান #... বা চালান নং: ...
+        for inv in re.findall(r'চালান(?:\s*নং)?[:\s]*#?\s*([A-Za-z0-9-]+)', text):
+            inv_clean = inv.strip()
+            if inv_clean:
+                found_invs.add(inv_clean)
+                found_invs.add(inv_clean.upper())
+                found_invs.add(inv_clean.lower())
+                
+        # 3. Check JSON in notes
+        if notes and notes.strip().startswith('{'):
+            try:
+                meta_e = json.loads(notes.split('\n')[0])
+                for key in ['invoiceId', 'invoiceNo', 'invoice_no', 'invoice_id']:
+                    val = meta_e.get(key)
+                    if val:
+                        s_val = str(val).strip()
+                        found_invs.add(s_val)
+                        found_invs.add(s_val.upper())
+                        found_invs.add(s_val.lower())
+            except Exception:
+                pass
+
+        for inv in found_invs:
+            if 'পরিবহন' in title or 'গাড়ি ভাড়া' in title or 'ভাড়া' in title or 'isShippingExpense' in notes:
+                covered_shipping_invoices.add(inv)
+            if 'ক্রয়' in title or 'ক্রয়' in notes:
+                if 'লেবার' in title or 'আনলোডিং' in title or 'আনলোড' in title or 'isLaborExpense' in notes:
+                    covered_purchase_labor_invoices.add(inv)
+            if ('রড' in title and ('আনলোডিং' in title or 'আনলোড' in title)) or 'rod_unloading' in notes:
+                covered_rod_unloading_invoices.add(inv)
+            elif 'আনলোডিং' in title or 'আনলোড' in title or 'cement_unloading' in notes:
+                covered_cement_unloading_invoices.add(inv)
+            elif 'রড' in title or 'rod_loading' in notes:
+                covered_rod_labor_invoices.add(inv)
+            elif 'লোডিং' in title or 'loading' in notes or 'লেবার' in title or 'isLaborExpense' in notes:
+                covered_cement_loading_invoices.add(inv)
+
+    extra_purchase_cash_out = Decimal('0.00')
+    for p in purchases_qs.filter(notes__startswith='{'):
+        try:
+            meta_p = json.loads(p.notes.split('\n')[0])
+            s_payer = meta_p.get('shippingPayer', 'shop')
+            l_payer = meta_p.get('laborPayer', 'shop')
+            
+            p_inv = (p.invoice_no or '').strip()
+            is_ship_covered = bool(p_inv and (p_inv in covered_shipping_invoices or p_inv.upper() in covered_shipping_invoices))
+            is_labor_covered = bool(p_inv and (
+                p_inv in covered_purchase_labor_invoices or p_inv.upper() in covered_purchase_labor_invoices or
+                p_inv in covered_cement_unloading_invoices or p_inv.upper() in covered_cement_unloading_invoices
+            ))
+
+            s_p = Decimal('0.00')
+            if s_payer != 'supplier' and not is_ship_covered:
+                s_p = Decimal(str(meta_p.get('shippingPaidAmount') or (meta_p.get('shippingCost') if meta_p.get('shippingStatus') == 'paid' else 0) or 0))
+                
+            l_p = Decimal('0.00')
+            if l_payer != 'supplier' and not is_labor_covered:
+                l_p = Decimal(str(meta_p.get('laborPaidAmount') or (meta_p.get('laborCost') if meta_p.get('laborStatus') == 'paid' else 0) or 0))
+                
+            extra_purchase_cash_out += (s_p + l_p)
+        except Exception:
+            pass
+
+    covered_invoices = covered_shipping_invoices | covered_purchase_labor_invoices | covered_cement_loading_invoices | covered_cement_unloading_invoices | covered_rod_labor_invoices | covered_rod_unloading_invoices
+
+    # Calculate extra sales shipping, rod labor, and cement loading paid in cash from active sales
+    # (Skip each item individually if already recorded in Expense table to prevent double-counting)
+    extra_sales_cash_out = Decimal('0.00')
+    for s in sales_qs.filter(notes__startswith='{'):
+        try:
+            meta_s = json.loads(s.notes.split('\n')[0])
+            s_inv = (s.invoice_no or '').strip()
+            # Cement loading
+            if not s_inv or (s_inv not in covered_cement_loading_invoices and s_inv.upper() not in covered_cement_loading_invoices):
+                if not meta_s.get('isHistoricalLabor'):
+                    c_p = Decimal(str(meta_s.get('cementLoadingPaidAmount') or (meta_s.get('cementLaborCost') if meta_s.get('cementLoadingPaid') else 0) or 0))
+                    extra_sales_cash_out += c_p
+            # Cement unloading
+            if not s_inv or (s_inv not in covered_cement_unloading_invoices and s_inv.upper() not in covered_cement_unloading_invoices):
+                if not meta_s.get('isHistoricalLabor'):
+                    cu_p = Decimal(str(meta_s.get('cementUnloadingPaidAmount') or (meta_s.get('cementUnloadingCost') if meta_s.get('cementUnloadingPaid') else 0) or 0))
+                    extra_sales_cash_out += cu_p
+            # Rod labor loading
+            if not s_inv or (s_inv not in covered_rod_labor_invoices and s_inv.upper() not in covered_rod_labor_invoices):
+                if not meta_s.get('isHistoricalLabor'):
+                    r_p = Decimal(str(meta_s.get('rodLaborPaidAmount') or (meta_s.get('rodLaborCost') if meta_s.get('rodLaborPaid') else 0) or 0))
+                    extra_sales_cash_out += r_p
+            # Rod labor unloading
+            if not s_inv or (s_inv not in covered_rod_unloading_invoices and s_inv.upper() not in covered_rod_unloading_invoices):
+                if not meta_s.get('isHistoricalLabor'):
+                    ru_p = Decimal(str(meta_s.get('rodUnloadingPaidAmount') or (meta_s.get('rodUnloadingCost') if meta_s.get('rodUnloadingPaid') else 0) or 0))
+                    extra_sales_cash_out += ru_p
+            # Sales shipping
+            if not s_inv or (s_inv not in covered_shipping_invoices and s_inv.upper() not in covered_shipping_invoices):
+                if not meta_s.get('isHistoricalShipping'):
+                    sh_p = Decimal(str(meta_s.get('salesShippingPaidAmount') or (meta_s.get('shippingCost') if meta_s.get('salesShippingPaid') else 0) or 0))
+                    extra_sales_cash_out += sh_p
+        except Exception:
+            pass
+
+    # Include all real cash payment_out transactions and expenses (Case-Insensitive)
+    cash_methods = ['cash', 'Cash', 'CASH', 'split', 'Split', None, '']
+    bank_methods = ['bank', 'Bank', 'BANK', 'cheque', 'Cheque', 'mobile_banking', 'mobile', 'bkash']
+
+    filtered_p_out_qs = p_out_qs
+    filtered_p_in_qs = p_in_qs
+    filtered_exp_qs = exp_qs
+
+    # Sale return cash & bank refund payments made to customers
+    sale_return_cash_out = sale_returns_qs.filter(payment_method__in=cash_methods).aggregate(tot=Sum('paid_amount'))['tot'] or Decimal('0.00')
+    sale_return_bank_out = sale_returns_qs.filter(payment_method__in=bank_methods).aggregate(tot=Sum('paid_amount'))['tot'] or Decimal('0.00')
+
+    # Exclude payment_out transactions that are already recorded as separate Expenses (labor/loading/shipping) to prevent double deduction
+    cash_p_out_qs = filtered_p_out_qs.exclude(notes__contains='isLaborExpense').exclude(notes__contains='isShippingExpense').exclude(notes__contains='[লেবার খরচ পরিশোধ').exclude(notes__contains='গাড়ি ভাড়া পরিশোধ]')
+
+    cash_out = (
+        (purchases_qs.filter(payment_method__in=cash_methods).aggregate(tot=Sum('paid_amount'))['tot'] or Decimal('0.00')) +
+        sale_return_cash_out +
+        extra_purchase_cash_out +
+        extra_sales_cash_out +
+        (cash_p_out_qs.filter(payment_method__in=cash_methods).aggregate(tot=Sum('paid_amount'))['tot'] or Decimal('0.00')) +
+        (filtered_exp_qs.filter(payment_method__in=cash_methods).aggregate(tot=Sum('amount'))['tot'] or Decimal('0.00'))
+    )
+    cash_balance = cash_in - cash_out
+
+    # Exclude internal balance transfers and duplicate labor/shipping expenses from bank_out
+    bank_p_out_qs = filtered_p_out_qs.exclude(notes__contains='isTransfer').exclude(notes__contains='ব্যালেন্স ট্রান্সফার').exclude(party_name__contains='➔').exclude(notes__contains='isLaborExpense').exclude(notes__contains='isShippingExpense').exclude(notes__contains='[লেবার খরচ পরিশোধ').exclude(notes__contains='গাড়ি ভাড়া পরিশোধ]')
+    bank_out = (
+        (purchases_qs.filter(payment_method__in=bank_methods).aggregate(tot=Sum('paid_amount'))['tot'] or Decimal('0.00')) +
+        sale_return_bank_out +
+        (bank_p_out_qs.filter(payment_method__in=bank_methods).aggregate(tot=Sum('paid_amount'))['tot'] or Decimal('0.00')) +
+        (filtered_exp_qs.filter(payment_method__in=bank_methods).aggregate(tot=Sum('amount'))['tot'] or Decimal('0.00'))
+    )
+    banks_initial = Bank.objects.aggregate(tot=Sum('balance'))['tot'] or Decimal('0.00')
+    bank_balance = banks_initial + bank_in - bank_out
+
+    return cash_balance, bank_balance
+
+
+from .services import recalculate_product_stock_and_cost
+
+class TransactionSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(read_only=True)
+    invoice_no = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    subtotal = RoundedDecimalField(max_digits=12, decimal_places=2, required=False)
+    discount = RoundedDecimalField(max_digits=12, decimal_places=2, required=False)
+    tax = RoundedDecimalField(max_digits=12, decimal_places=2, required=False)
+    total_amount = RoundedDecimalField(max_digits=12, decimal_places=2, required=False)
+    paid_amount = RoundedDecimalField(max_digits=12, decimal_places=2, required=False)
+    due_amount = RoundedDecimalField(max_digits=12, decimal_places=2, required=False)
+    items = TransactionItemSerializer(many=True, required=False)
+
+    class Meta:
+        model = Transaction
+        fields = '__all__'
+
+    def validate(self, attrs):
+        tx_type = attrs.get('transaction_type') or (self.instance.transaction_type if self.instance else None)
+        paid_amt = attrs.get('paid_amount')
+        if paid_amt is None and self.instance:
+            paid_amt = self.instance.paid_amount
+        paid_amt = Decimal(str(paid_amt or 0))
+
+        pay_method = (attrs.get('payment_method') or (self.instance.payment_method if self.instance else 'cash') or 'cash').lower()
+        if 'payment_method' in attrs:
+            attrs['payment_method'] = pay_method
+        curr_status = attrs.get('status') or (self.instance.status if self.instance else 'pending')
+
+        # Enforce balance check on money outflows (purchase, payment_out, or sale_return) only when active/approved
+        if tx_type in ['purchase', 'payment_out', 'sale_return'] and curr_status not in ['pending', 'draft', 'cancelled', 'rejected']:
+            exclude_id = self.instance.id if self.instance else None
+            cash_bal, bank_bal = get_available_balances(exclude_tx_id=exclude_id)
+            
+            notes_val = attrs.get('notes') or (self.instance.notes if self.instance else '')
+            meta = {}
+            if notes_val and notes_val.strip().startswith('{'):
+                try:
+                    import json
+                    meta = json.loads(notes_val.split('\n')[0])
+                except Exception:
+                    meta = {}
+
+            is_bank_to_bank = 'banktobank' in pay_method or meta.get('paymentMethodName') == 'BankToBank' or 'bank_to_bank' in str(meta).lower()
+            is_cheque = any(c in pay_method for c in ['cheque', 'check']) or meta.get('paymentMethodName') == 'Cheque'
+
+            # Calculate additional cash paid for shipping and labor (only when paid directly by shop)
+            ship_payer = meta.get('shippingPayer', 'shop')
+            labor_payer = meta.get('laborPayer', 'shop')
+            ship_paid = Decimal(str(meta.get('shippingPaidAmount') or (meta.get('shippingCost') if meta.get('shippingStatus') == 'paid' else 0) or 0)) if ship_payer != 'supplier' else Decimal('0.00')
+            lab_paid = Decimal(str(meta.get('laborPaidAmount') or (meta.get('laborCost') if meta.get('laborStatus') == 'paid' else 0) or 0)) if labor_payer != 'supplier' else Decimal('0.00')
+            extra_cash_expenses = ship_paid + lab_paid
+
+            if is_bank_to_bank or is_cheque:
+                # Bank-to-Bank and Cheque: Check the specifically selected bank account for goods payment
+                target_bank = None
+                bank_id = meta.get('bankId') or meta.get('bank_id')
+                bank_name = meta.get('selectedShopBank') or meta.get('bankName') or meta.get('chequeBank')
+                if bank_id:
+                    target_bank = Bank.objects.filter(id=int(bank_id)).first()
+                elif bank_name:
+                    clean_bn = str(bank_name).split(' - ')[0].split(' (')[0].strip()
+                    target_bank = Bank.objects.filter(name__icontains=clean_bn).first()
+
+                avail_balance = target_bank.balance if target_bank else bank_bal
+                bank_label = f"'{target_bank.name}'" if target_bank else "ব্যাংক"
+                if paid_amt > avail_balance:
+                    raise serializers.ValidationError({
+                        'paid_amount': f"পর্যাপ্ত ব্যাংক ব্যালেন্স নেই! (নির্বাচিত {bank_label} একাউন্ট ব্যালেন্স: ৳ {avail_balance:,.2f}, পেমেন্ট দিতে চাচ্ছেন: ৳ {paid_amt:,.2f})। অনুগ্রহ করে আগে এই ব্যাংক একাউন্টে ব্যালেন্স জমা করুন অথবা বাকি চালান হিসেবে কাটুন।"
+                    })
+                
+                # Check cash balance for shipping and labor if paid in cash
+                if extra_cash_expenses > 0 and extra_cash_expenses > cash_bal:
+                    raise serializers.ValidationError({
+                        'paid_amount': f"পর্যাপ্ত নগদ ক্যাশ ব্যালেন্স নেই! (বর্তমান ক্যাশ ব্যালেন্স: ৳ {cash_bal:,.2f}, গাড়ি ভাড়া ও লেবার বাবদ নগদ পরিশোধ করতে চাচ্ছেন: ৳ {extra_cash_expenses:,.2f} [গাড়ি ভাড়া: ৳ {ship_paid:,.2f}, লেবার: ৳ {lab_paid:,.2f}])। ক্যাশে পর্যাপ্ত ব্যালেন্স না থাকলে গাড়ি ভাড়া/লেবার নগদ পরিশোধ করা যাবে না।"
+                    })
+            else:
+                # Cash & Bank Transfer: Check Cash balance for total cash outflow (goods paid + shipping + labor)
+                total_cash_needed = paid_amt + extra_cash_expenses
+                if total_cash_needed > 0 and total_cash_needed > cash_bal:
+                    breakdown = f"পণ্য বাবদ: ৳ {paid_amt:,.2f}"
+                    if ship_paid > 0:
+                        breakdown += f" + গাড়ি ভাড়া: ৳ {ship_paid:,.2f}"
+                    if lab_paid > 0:
+                        breakdown += f" + লেবার খরচ: ৳ {lab_paid:,.2f}"
+                    raise serializers.ValidationError({
+                        'paid_amount': f"পর্যাপ্ত নগদ ক্যাশ ব্যালেন্স নেই! (বর্তমান ক্যাশ ব্যালেন্স: ৳ {cash_bal:,.2f}, মোট নগদ পরিশোধ করতে চাচ্ছেন: ৳ {total_cash_needed:,.2f} [{breakdown}])। ক্যাশে পর্যাপ্ত ব্যালেন্স না থাকলে নগদ প্রদান বা গাড়ি ভাড়া/লেবার পরিশোধ করা যাবে না।"
+                    })
+
+        return attrs
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        if not validated_data.get('invoice_no'):
+            from django.utils import timezone
+            year = timezone.now().year
+            last_id = Transaction.objects.order_by('-id').first()
+            next_id = (last_id.id + 1) if last_id else 1
+            validated_data['invoice_no'] = f"INV-{year}-{next_id:04d}"
+
+        party = validated_data.get('party')
+        if party and not validated_data.get('party_name'):
+            validated_data['party_name'] = party.name
+            validated_data['party_phone'] = party.phone
+
+        transaction = Transaction.objects.create(**validated_data)
+        is_active = transaction.status not in ['pending', 'draft', 'cancelled', 'rejected']
+
+        affected_product_ids = set()
+
+        for item_data in items_data:
+            sell_price_input = item_data.pop('sell_price', None)
+            item_data.pop('cost_price', None)
+
+            t_item = TransactionItem.objects.create(transaction=transaction, **item_data)
+            prod = t_item.product
+            if not prod and t_item.product_name:
+                prod = Product.objects.filter(name__iexact=t_item.product_name.strip()).first()
+                if not prod and is_active:
+                    prod = find_or_create_product_for_purchase(
+                        item_name=t_item.product_name,
+                        unit=t_item.unit,
+                        price=t_item.price,
+                        sell_price=sell_price_input
+                    )
+                if prod:
+                    t_item.product = prod
+                    t_item.save(update_fields=['product'])
+
+            if prod and is_active:
+                affected_product_ids.add(prod.id)
+                # Update selling price if specified in purchase
+                if transaction.transaction_type == 'purchase' and sell_price_input is not None and float(sell_price_input) > 0:
+                    prod.sell_price = round(float(sell_price_input), 2)
+                    prod.save(update_fields=['sell_price'])
+
+        if party and is_active:
+            recalculate_party_balances(party)
+
+        # Trigger engineer balance recalculation if tagged in notes
+        if is_active and transaction.notes and transaction.notes.strip().startswith('{'):
+            try:
+                import json
+                meta_val = json.loads(transaction.notes.split('\n')[0])
+                eng_id_val = meta_val.get('engineerId') or meta_val.get('selectedEngineerId')
+                if eng_id_val:
+                    eng_obj = Party.objects.filter(id=int(eng_id_val), party_type='engineer').first()
+                    if eng_obj:
+                        recalculate_party_balances(eng_obj)
+            except Exception:
+                pass
+
+        # Chronologically recalculate stock & weighted cost for all affected products
+        if is_active:
+            for pid in affected_product_ids:
+                recalculate_product_stock_and_cost(pid)
+
+        return transaction
+
+    def update(self, instance, validated_data):
+        import json
+        items_data = validated_data.pop('items', None)
+        old_party = Party.objects.filter(id=instance.party_id).first() if instance.party_id else None
+        old_type = instance.transaction_type
+        old_total = Decimal(str(instance.total_amount or 0))
+        old_due = Decimal(str(instance.due_amount or 0))
+        old_paid = Decimal(str(instance.paid_amount or 0))
+
+        affected_product_ids = set(instance.items.exclude(product__isnull=True).values_list('product_id', flat=True))
+
+        old_is_active = instance.status not in ['pending', 'draft', 'cancelled', 'rejected']
+
+        # 1. Delete old items if new items provided
+        if items_data is not None:
+            instance.items.all().delete()
+
+        # 3. Update instance attributes
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+
+        new_is_active = instance.status not in ['pending', 'draft', 'cancelled', 'rejected']
+
+        # 4. If items are provided, create new items
+        if items_data is not None:
+            for item_data in items_data:
+                sell_price_input = item_data.pop('sell_price', None)
+                item_data.pop('cost_price', None)
+                t_item = TransactionItem.objects.create(transaction=instance, **item_data)
+                prod = t_item.product
+
+                if not prod and t_item.product_name:
+                    prod = Product.objects.filter(name__iexact=t_item.product_name.strip()).first()
+                    if not prod and new_is_active:
+                        prod = find_or_create_product_for_purchase(
+                            item_name=t_item.product_name,
+                            unit=t_item.unit,
+                            price=t_item.price,
+                            sell_price=sell_price_input
+                        )
+                    if prod:
+                        t_item.product = prod
+                        t_item.save(update_fields=['product'])
+
+                if prod and new_is_active:
+                    affected_product_ids.add(prod.id)
+                    if instance.transaction_type == 'purchase' and sell_price_input is not None and float(sell_price_input) > 0:
+                        prod.sell_price = round(float(sell_price_input), 2)
+                        prod.save(update_fields=['sell_price'])
+
+        # 4b. When transitioning from unapproved (pending/draft) to active (approved),
+        # ensure any unlinked items now create/find products and get added to affected_product_ids
+        if not old_is_active and new_is_active:
+            for it in instance.items.all():
+                p = it.product
+                if not p and it.product_name:
+                    p = Product.objects.filter(name__iexact=it.product_name.strip()).first()
+                    if not p:
+                        p = find_or_create_product_for_purchase(
+                            item_name=it.product_name,
+                            unit=it.unit,
+                            price=it.price
+                        )
+                    if p:
+                        it.product = p
+                        it.save(update_fields=['product'])
+                if p:
+                    affected_product_ids.add(p.id)
+
+        # 5. Recalculate party balances for old and new party if either state was/is active
+        if old_is_active or new_is_active:
+            if old_party:
+                recalculate_party_balances(old_party)
+            if instance.party_id and (not old_party or instance.party_id != old_party.id):
+                new_party = Party.objects.filter(id=instance.party_id).first()
+                if new_party:
+                    recalculate_party_balances(new_party)
+
+            # Trigger engineer balance recalculation for affected engineers
+            for n_source in [instance.notes]:
+                if n_source and n_source.strip().startswith('{'):
+                    try:
+                        import json
+                        meta_val = json.loads(n_source.split('\n')[0])
+                        eng_id_val = meta_val.get('engineerId') or meta_val.get('selectedEngineerId')
+                        if eng_id_val:
+                            eng_obj = Party.objects.filter(id=int(eng_id_val), party_type='engineer').first()
+                            if eng_obj:
+                                recalculate_party_balances(eng_obj)
+                    except Exception:
+                        pass
+
+        # 6. Chronologically recalculate stock & weighted cost for all affected products only if active
+        if old_is_active or new_is_active:
+            for pid in affected_product_ids:
+                recalculate_product_stock_and_cost(pid)
+
+        return instance
+
+class ExpenseCategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ExpenseCategory
+        fields = '__all__'
+
+class ExpenseSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = Expense
+        fields = '__all__'
+
+    def validate(self, attrs):
+        cat_name = attrs.get('category_name') or (self.instance.category_name if self.instance else '')
+        if not attrs.get('title'):
+            attrs['title'] = cat_name or 'সাধারণ খরচ'
+
+        amt = attrs.get('amount')
+        if amt is None and self.instance:
+            amt = self.instance.amount
+        amt = Decimal(str(amt or 0))
+
+        pay_method = (attrs.get('payment_method') or (self.instance.payment_method if self.instance else 'cash') or 'cash').lower()
+
+        if amt > 0:
+            is_adjustment = (
+                any(k in pay_method for k in ['adjust', 'সমন্বয়', 'due']) or
+                'সমন্বয়' in cat_name or
+                'আয়' in cat_name or
+                'কমিশন আয়' in cat_name
+            )
+            if not is_adjustment:
+                exclude_id = self.instance.id if self.instance else None
+                cash_bal, bank_bal = get_available_balances(exclude_expense_id=exclude_id)
+                is_bank = any(b in pay_method for b in ['bank', 'cheque', 'mobile', 'bkash'])
+                if is_bank:
+                    target_bank = attrs.get('bank_account') or (self.instance.bank_account if self.instance else None)
+                    if target_bank:
+                        target_bank_bal = target_bank.balance
+                        if amt > target_bank_bal:
+                            raise serializers.ValidationError({
+                                'amount': f"পর্যাপ্ত ব্যাংক ব্যালেন্স নেই! (নির্বাচিত '{target_bank.name}' একাউন্ট ব্যালেন্স: ৳ {target_bank_bal:,.2f}, খরচ দিতে চাচ্ছেন: ৳ {amt:,.2f})। অনুগ্রহ করে আগে এই ব্যাংক একাউন্টে ব্যালেন্স জমা করুন।"
+                            })
+                    elif amt > bank_bal:
+                        raise serializers.ValidationError({
+                            'amount': f"পর্যাপ্ত ব্যাংক ব্যালেন্স নেই! (বর্তমান ব্যাংক ব্যালেন্স: ৳ {bank_bal:,.2f}, খরচ দিতে চাচ্ছেন: ৳ {amt:,.2f})। অনুগ্রহ করে আগে ব্যাংকে ব্যালেন্স জমা করুন।"
+                        })
+                else:
+                    if amt > cash_bal:
+                        raise serializers.ValidationError({
+                            'amount': f"পর্যাপ্ত নগদ ক্যাশ ব্যালেন্স নেই! (বর্তমান ক্যাশ ব্যালেন্স: ৳ {cash_bal:,.2f}, খরচ দিতে চাচ্ছেন: ৳ {amt:,.2f})। অনুগ্রহ করে আগে ক্যাশে ব্যালেন্স জমা করুন।"
+                        })
+        return attrs
+
+    def create(self, validated_data):
+        cat_name = validated_data.get('category_name')
+        if cat_name and not validated_data.get('category'):
+            cat, _ = ExpenseCategory.objects.get_or_create(name=cat_name.strip())
+            validated_data['category'] = cat
+        if not validated_data.get('title') and cat_name:
+            validated_data['title'] = cat_name
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        cat_name = validated_data.get('category_name')
+        if cat_name and not validated_data.get('category'):
+            cat, _ = ExpenseCategory.objects.get_or_create(name=cat_name.strip())
+            validated_data['category'] = cat
+        if not validated_data.get('title') and cat_name:
+            validated_data['title'] = cat_name
+        return super().update(instance, validated_data)
+
+class HawlatSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = Hawlat
+        fields = '__all__'
+
+
+from django.contrib.auth.models import User
+from .models import UserProfile
+
+class UserProfileSerializer(serializers.ModelSerializer):
+    role_display = serializers.CharField(source='get_role_display', read_only=True)
+    role_badge = serializers.CharField(source='role_display_badge', read_only=True)
+
+    class Meta:
+        model = UserProfile
+        fields = ['id', 'role', 'role_display', 'role_badge', 'full_name', 'phone', 'avatar', 'is_active', 'created_at']
+
+
+class UserSerializer(serializers.ModelSerializer):
+    profile = UserProfileSerializer(read_only=True)
+    role = serializers.SerializerMethodField()
+    role_display = serializers.SerializerMethodField()
+    role_badge = serializers.SerializerMethodField()
+    full_name = serializers.SerializerMethodField()
+    phone = serializers.SerializerMethodField()
+    avatar = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = ['id', 'username', 'email', 'first_name', 'last_name', 'is_active', 'is_superuser', 'profile', 'role', 'role_display', 'role_badge', 'full_name', 'phone', 'avatar', 'date_joined']
+
+    def get_role(self, obj):
+        if hasattr(obj, 'profile') and obj.profile and obj.profile.role:
+            return obj.profile.role
+        if obj.is_superuser:
+            return 'developer'
+        return 'staff'
+
+    def get_role_display(self, obj):
+        if hasattr(obj, 'profile') and obj.profile:
+            return obj.profile.get_role_display()
+        return 'ডেভেলপার' if obj.is_superuser else 'স্টাফ'
+
+    def get_role_badge(self, obj):
+        if hasattr(obj, 'profile') and obj.profile:
+            return obj.profile.role_display_badge
+        return '🛠️ ডেভেলপার' if obj.is_superuser else '👔 স্টাফ'
+
+    def get_full_name(self, obj):
+        if hasattr(obj, 'profile') and obj.profile and obj.profile.full_name:
+            return obj.profile.full_name
+        name = f"{obj.first_name} {obj.last_name}".strip()
+        return name or obj.username
+
+    def get_phone(self, obj):
+        if hasattr(obj, 'profile') and obj.profile:
+            return obj.profile.phone or ''
+        return ''
+
+    def get_avatar(self, obj):
+        if hasattr(obj, 'profile') and obj.profile:
+            return obj.profile.avatar or ''
+        return ''
+
+
