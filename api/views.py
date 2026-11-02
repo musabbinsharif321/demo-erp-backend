@@ -697,7 +697,7 @@ def apply_product_custom_ordering(qs):
         cat_order=cat_order,
         sub_order=sub_order,
         size_order=size_order
-    ).order_by('cat_order', 'sub_order', 'size_order', 'name')
+    ).order_by('cat_order', 'category_name', 'sub_order', 'size_order', 'name')
 
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.select_related('category').all()

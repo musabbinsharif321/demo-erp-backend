@@ -108,6 +108,11 @@ class Product(models.Model):
     def save(self, *args, **kwargs):
         if not self.pk and (self.opening_stock is None or self.opening_stock == 0) and self.stock:
             self.opening_stock = self.stock
+        if self.category_name and not self.category:
+            cat_obj, _ = Category.objects.get_or_create(name=self.category_name.strip())
+            self.category = cat_obj
+        elif self.category and not self.category_name:
+            self.category_name = self.category.name
         super().save(*args, **kwargs)
 
     def __str__(self):

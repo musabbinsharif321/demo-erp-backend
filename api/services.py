@@ -4,7 +4,7 @@ from .models import Product, TransactionItem
 
 def recalculate_product_stock_and_cost(product_or_id):
     """
-    Chronologically recalculates stock and weighted average purchase price
+    Chronologically recalculates stock and sets the latest purchase price
     for a given product from all its historical transactions.
     """
     if not product_or_id:
@@ -45,30 +45,8 @@ def recalculate_product_stock_and_cost(product_or_id):
         unit_price = float(item.price or 0)
 
         if tx_type == 'purchase':
-            # Extract landed cost (shipping + labor from notes)
-            extra_per_unit = 0.0
-            if tx.notes and tx.notes.strip().startswith('{'):
-                try:
-                    first_line = tx.notes.split('\n')[0]
-                    meta = json.loads(first_line)
-                    is_landed_auto = meta.get('isLandedCostAuto', True)
-                    if is_landed_auto is not False and is_landed_auto != 'false' and is_landed_auto != 0:
-                        ship = float(meta.get('shippingCost') or 0.0)
-                        lab = float(meta.get('laborCost') or 0.0)
-                        tot_extra = ship + lab
-                        tot_qty = sum(float(it.quantity or 0) for it in tx.items.all())
-                        if tot_qty > 0 and tot_extra > 0:
-                            extra_per_unit = tot_extra / tot_qty
-                except Exception:
-                    pass
-
-            landed_price = unit_price + extra_per_unit
-
-            if (running_stock + qty) > 0 and running_stock > 0 and running_purchase_price > 0:
-                running_purchase_price = ((running_stock * running_purchase_price) + (qty * landed_price)) / (running_stock + qty)
-            elif landed_price > 0:
-                running_purchase_price = landed_price
-
+            if unit_price > 0:
+                running_purchase_price = unit_price
             running_stock += qty
 
         elif tx_type == 'sale':
@@ -154,30 +132,11 @@ def generate_product_cost_log(product_or_id):
         extra_per_unit = 0.0
 
         if tx_type == 'purchase':
-            if tx.notes and tx.notes.strip().startswith('{'):
-                try:
-                    first_line = tx.notes.split('\n')[0]
-                    meta = json.loads(first_line)
-                    is_landed_auto = meta.get('isLandedCostAuto', True)
-                    if is_landed_auto is not False and is_landed_auto != 'false' and is_landed_auto != 0:
-                        ship = float(meta.get('shippingCost') or 0.0)
-                        lab = float(meta.get('laborCost') or 0.0)
-                        tot_extra = ship + lab
-                        tot_qty = sum(float(it.quantity or 0) for it in tx.items.all())
-                        if tot_qty > 0 and tot_extra > 0:
-                            extra_per_unit = tot_extra / tot_qty
-                except Exception:
-                    pass
-
-            landed_price = unit_price + extra_per_unit
-
-            if (running_stock + qty) > 0 and running_stock > 0 and running_purchase_price > 0:
-                new_price = ((running_stock * running_purchase_price) + (qty * landed_price)) / (running_stock + qty)
-                formula = f"(({round(running_stock, 2)} × ৳{round(running_purchase_price, 2)}) + ({round(qty, 2)} × ৳{round(landed_price, 2)})) / {round(running_stock + qty, 2)} = ৳{round(new_price, 2)}"
-                running_purchase_price = new_price
-            elif landed_price > 0:
-                running_purchase_price = landed_price
-                formula = f"নতুন রেট: ৳{round(landed_price, 2)}"
+            if unit_price > 0:
+                running_purchase_price = unit_price
+                formula = f"নতুন ক্রয়মূল্য: ৳{round(unit_price, 2)}"
+            else:
+                formula = f"ক্রয়: +{round(qty, 2)} {product.unit}"
 
             running_stock += qty
 
