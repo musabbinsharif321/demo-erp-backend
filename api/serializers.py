@@ -184,10 +184,16 @@ class TransactionItemSerializer(serializers.ModelSerializer):
     price = RoundedDecimalField(max_digits=12, decimal_places=2, required=False)
     total = RoundedDecimalField(max_digits=12, decimal_places=2, required=False)
     sell_price = RoundedDecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    buy_price = serializers.SerializerMethodField()
+
+    def get_buy_price(self, obj):
+        if obj.product and obj.product.purchase_price:
+            return float(obj.product.purchase_price)
+        return 0.0
 
     class Meta:
         model = TransactionItem
-        fields = ['id', 'product', 'product_name', 'quantity', 'price', 'sell_price', 'unit', 'total']
+        fields = ['id', 'product', 'product_name', 'quantity', 'price', 'sell_price', 'buy_price', 'unit', 'total']
 
 import re
 
@@ -614,6 +620,31 @@ class TransactionSerializer(serializers.ModelSerializer):
     paid_amount = RoundedDecimalField(max_digits=12, decimal_places=2, required=False)
     due_amount = RoundedDecimalField(max_digits=12, decimal_places=2, required=False)
     items = TransactionItemSerializer(many=True, required=False)
+    profit = serializers.SerializerMethodField()
+    cost_amount = serializers.SerializerMethodField()
+
+    def get_cost_amount(self, obj):
+        total_cost = Decimal('0.00')
+        for item in obj.items.all():
+            cost_rate = Decimal('0.00')
+            if item.product and item.product.purchase_price:
+                cost_rate = item.product.purchase_price
+            total_cost += cost_rate * (item.quantity or Decimal('0'))
+        return float(total_cost)
+
+    def get_profit(self, obj):
+        if obj.transaction_type != 'sale':
+            return 0.0
+        total_cost = Decimal('0.00')
+        for item in obj.items.all():
+            cost_rate = Decimal('0.00')
+            if item.product and item.product.purchase_price:
+                cost_rate = item.product.purchase_price
+            total_cost += cost_rate * (item.quantity or Decimal('0'))
+        subtotal = obj.subtotal or Decimal('0.00')
+        discount = obj.discount or Decimal('0.00')
+        gross_rev = max(Decimal('0.00'), subtotal - discount)
+        return float(gross_rev - total_cost)
 
     class Meta:
         model = Transaction
