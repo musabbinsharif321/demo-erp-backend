@@ -71,6 +71,8 @@ class PartyViewSet(viewsets.ModelViewSet):
                 qs = qs.filter(Q(party_type='supplier') | Q(party_type='both'))
             elif party_type == 'engineer':
                 qs = qs.filter(party_type='engineer')
+            elif party_type == 'partner':
+                qs = qs.filter(party_type='partner')
         
         if search:
             qs = qs.filter(

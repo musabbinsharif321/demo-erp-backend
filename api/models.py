@@ -24,6 +24,7 @@ class Party(models.Model):
         ('customer', 'Customer'),
         ('supplier', 'Supplier'),
         ('engineer', 'Engineer'),
+        ('partner', 'Partner'),
         ('both', 'Both'),
     ]
 
@@ -176,6 +177,7 @@ class Transaction(models.Model):
     cheque_due_date = models.DateField(blank=True, null=True)
     cheque_status = models.CharField(max_length=20, choices=CHEQUE_STATUS, default='pending')
     notes = models.TextField(blank=True, null=True)
+    attachment = models.FileField(upload_to='transaction_attachments/', null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
 

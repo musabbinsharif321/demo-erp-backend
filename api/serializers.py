@@ -185,15 +185,21 @@ class TransactionItemSerializer(serializers.ModelSerializer):
     total = RoundedDecimalField(max_digits=12, decimal_places=2, required=False)
     sell_price = RoundedDecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
     buy_price = serializers.SerializerMethodField()
+    brand = serializers.SerializerMethodField()
 
     def get_buy_price(self, obj):
         if obj.product and obj.product.purchase_price:
             return float(obj.product.purchase_price)
         return 0.0
 
+    def get_brand(self, obj):
+        if obj.product and obj.product.brand:
+            return obj.product.brand
+        return ''
+
     class Meta:
         model = TransactionItem
-        fields = ['id', 'product', 'product_name', 'quantity', 'price', 'sell_price', 'buy_price', 'unit', 'total']
+        fields = ['id', 'product', 'product_name', 'brand', 'quantity', 'price', 'sell_price', 'buy_price', 'unit', 'total']
 
 import re
 
